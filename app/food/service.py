@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from app.core.clock import from_storage, to_storage
 from app.database import get_connection, transaction
+from app.risk.service import RiskService
 
 
 SCHEMA = """
@@ -108,6 +110,9 @@ def _now() -> str:
 
 def ensure_schema() -> None:
     get_connection().executescript(SCHEMA)
+    # 食品流程会写入风险事件，确保风险画像表结构同步就绪
+    from app.risk.service import ensure_schema as ensure_risk_schema
+    ensure_risk_schema()
 
 
 def _dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -116,6 +121,11 @@ def _dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
 
 def _result_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def _lot_code(connection: sqlite3.Connection, lot_id: int) -> str:
+    row = connection.execute("SELECT lot_code FROM food_lots WHERE id=?", (lot_id,)).fetchone()
+    return row["lot_code"] if row else ""
 
 
 class FoodService:
@@ -128,9 +138,12 @@ class FoodService:
     def create_lot(self, payload: dict[str, Any], actor: str = "system") -> dict[str, Any]:
         now = _now()
         with transaction(immediate=True) as connection:
+            risk = RiskService(connection, ensure=False)
+            supplier = risk.register_supplier(payload["supplier"], actor=actor, conn=connection)
+            ratio = risk.current_sampling_ratio(supplier["id"], conn=connection)
             cursor = connection.execute(
-                "INSERT INTO food_lots(lot_code,product_name,category,supplier,origin,harvest_date,quantity_kg,trace_code,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (payload["lot_code"], payload["product_name"], payload["category"], payload["supplier"], payload["origin"], payload["harvest_date"], payload["quantity_kg"], payload["trace_code"], now, now),
+                "INSERT INTO food_lots(lot_code,product_name,category,supplier,origin,harvest_date,quantity_kg,trace_code,supplier_id,recommended_sampling_ratio,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (payload["lot_code"], payload["product_name"], payload["category"], payload["supplier"], payload["origin"], payload["harvest_date"], payload["quantity_kg"], payload["trace_code"], supplier["id"], ratio, now, now),
             )
             lot_id = cursor.lastrowid
             connection.execute("INSERT INTO food_audit(lot_id,action,actor,payload_json,created_at) VALUES(?,?,?,?,?)", (lot_id, "lot.create", actor, json.dumps(payload, ensure_ascii=False), now))
@@ -174,13 +187,59 @@ class FoodService:
             if existing:
                 return dict(existing)
             cursor = connection.execute("INSERT INTO food_test_results(sample_id,analyte,method,value_mg_kg,limit_mg_kg,unit,lab_operator,tested_at,certificate_no,verdict,result_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (sample_id, payload["analyte"], payload["method"], payload["value_mg_kg"], payload["limit_mg_kg"], payload["unit"], payload["lab_operator"], payload["tested_at"], payload["certificate_no"], verdict, result_hash, now))
+            result_id = cursor.lastrowid
             connection.execute("UPDATE food_samples SET status='complete' WHERE id=?", (sample_id,))
             lot_id = sample["lot_id"]
             failed = connection.execute("SELECT COUNT(*) FROM food_test_results WHERE sample_id=? AND verdict='fail'", (sample_id,)).fetchone()[0]
             if failed:
                 connection.execute("UPDATE food_lots SET risk_level='high',status='held',version=version+1,updated_at=? WHERE id=?", (now, lot_id))
+            lot = connection.execute("SELECT supplier_id FROM food_lots WHERE id=?", (lot_id,)).fetchone()
+            supplier_id = lot["supplier_id"]
+            risk = RiskService(connection, ensure=False)
+            if supplier_id is not None:
+                risk_payload = {
+                    "analyte": payload["analyte"],
+                    "method": payload["method"],
+                    "value_mg_kg": payload["value_mg_kg"],
+                    "limit_mg_kg": payload["limit_mg_kg"],
+                    "unit": payload["unit"],
+                    "sample_code": sample["sample_code"],
+                    "lot_code": _lot_code(connection, lot_id),
+                }
+                if verdict == "fail":
+                    magnitude = max(payload["value_mg_kg"] / payload["limit_mg_kg"] - 1.0, 0.0) if payload["limit_mg_kg"] else 0.0
+                    event = risk.record_event(
+                        event_type="test_fail", supplier_id=supplier_id,
+                        occurred_at=payload["tested_at"], payload=risk_payload,
+                        magnitude=round(magnitude, 4), lot_id=lot_id,
+                        ref_table="food_test_results", ref_id=result_id,
+                        actor=payload["lab_operator"], conn=connection,
+                    )
+                    rule = risk.get_active_rule(connection)
+                    due_at = to_storage(from_storage(payload["tested_at"]) + timedelta(days=int(rule["config"]["rectification_window_days"])))
+                    risk.open_rectification(
+                        supplier_id, f"{payload['analyte']} 超标整改（{risk_payload['lot_code']}）", due_at,
+                        lot_id=lot_id, reason_event_id=event["id"], operator=payload["lab_operator"], conn=connection,
+                    )
+                else:
+                    event = risk.record_event(
+                        event_type="test_pass", supplier_id=supplier_id,
+                        occurred_at=payload["tested_at"], payload=risk_payload,
+                        lot_id=lot_id, ref_table="food_test_results", ref_id=result_id,
+                        actor=payload["lab_operator"], conn=connection,
+                    )
+                score = risk.score_supplier(
+                    supplier_id, trigger_source="test_result",
+                    trigger_event_id=event["id"], actor=payload["lab_operator"], conn=connection,
+                )
+                ratio = risk.current_sampling_ratio(supplier_id, conn=connection)
+                connection.execute("UPDATE food_lots SET recommended_sampling_ratio=? WHERE id=?", (ratio, lot_id))
+                result = _dict(connection.execute("SELECT * FROM food_test_results WHERE id=?", (result_id,)).fetchone()) or {}
+                result["risk_score"] = {"version": score["version"], "status": score["status"], "level": score["level"], "sampling_ratio": ratio}
+            else:
+                result = _dict(connection.execute("SELECT * FROM food_test_results WHERE id=?", (result_id,)).fetchone()) or {}
             connection.execute("INSERT INTO food_audit(lot_id,action,actor,payload_json,created_at) VALUES(?,?,?,?,?)", (lot_id, "test.result", actor, json.dumps({**payload, "verdict": verdict}, ensure_ascii=False), now))
-            return _dict(connection.execute("SELECT * FROM food_test_results WHERE id=?", (cursor.lastrowid,)).fetchone()) or {}
+            return result
 
     def create_shipment(self, lot_id: int, payload: dict[str, Any], actor: str = "dispatcher") -> dict[str, Any]:
         lot = self.connection.execute("SELECT * FROM food_lots WHERE id=?", (lot_id,)).fetchone()
@@ -207,9 +266,36 @@ class FoodService:
             if existing:
                 return dict(existing)
             cursor = connection.execute("INSERT INTO food_temperatures(shipment_id,recorded_at,temperature_c,source,in_range,created_at) VALUES(?,?,?,?,?,?)", (shipment_id, payload["recorded_at"], payload["temperature_c"], payload["source"], in_range, now))
+            temp_id = cursor.lastrowid
             if not in_range:
                 connection.execute("UPDATE food_shipments SET status='delayed',updated_at=? WHERE id=? AND status IN ('planned','in_transit')", (now, shipment_id))
-            return _dict(connection.execute("SELECT * FROM food_temperatures WHERE id=?", (cursor.lastrowid,)).fetchone()) or {}
+                lot = connection.execute("SELECT l.id AS lot_id,l.supplier_id FROM food_shipments s JOIN food_lots l ON l.id=s.lot_id WHERE s.id=?", (shipment_id,)).fetchone()
+                lot_id, supplier_id = lot["lot_id"], lot["supplier_id"]
+                if supplier_id is not None:
+                    risk = RiskService(connection, ensure=False)
+                    magnitude = max(shipment["target_temp_min"] - payload["temperature_c"], payload["temperature_c"] - shipment["target_temp_max"], 0.0)
+                    event = risk.record_event(
+                        event_type="temperature_anomaly", supplier_id=supplier_id,
+                        occurred_at=payload["recorded_at"],
+                        payload={
+                            "shipment_code": shipment["shipment_code"],
+                            "recorded_at": payload["recorded_at"],
+                            "temperature_c": payload["temperature_c"],
+                            "target_temp_min": shipment["target_temp_min"],
+                            "target_temp_max": shipment["target_temp_max"],
+                            "lot_code": _lot_code(connection, lot_id),
+                        },
+                        magnitude=round(magnitude, 2), lot_id=lot_id,
+                        ref_table="food_temperatures", ref_id=temp_id,
+                        actor=payload["source"], conn=connection,
+                    )
+                    risk.score_supplier(
+                        supplier_id, trigger_source="temperature",
+                        trigger_event_id=event["id"], actor=payload["source"], conn=connection,
+                    )
+                    ratio = risk.current_sampling_ratio(supplier_id, conn=connection)
+                    connection.execute("UPDATE food_lots SET recommended_sampling_ratio=? WHERE id=?", (ratio, lot_id))
+            return _dict(connection.execute("SELECT * FROM food_temperatures WHERE id=?", (temp_id,)).fetchone()) or {}
 
     def decide_risk(self, lot_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         with transaction(immediate=True) as connection:
