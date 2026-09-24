@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.database import get_connection, transaction
+from app.risk.service import RiskService
 
 
 SCHEMA = """
@@ -134,7 +135,11 @@ class FoodService:
             )
             lot_id = cursor.lastrowid
             connection.execute("INSERT INTO food_audit(lot_id,action,actor,payload_json,created_at) VALUES(?,?,?,?,?)", (lot_id, "lot.create", actor, json.dumps(payload, ensure_ascii=False), now))
-            return _dict(connection.execute("SELECT * FROM food_lots WHERE id=?", (lot_id,)).fetchone()) or {}
+            # 按供应商当前已发布的风险画像落库本批次的抽检比例；供应商已合并/停用时抛 ValueError。
+            sampling = RiskService(connection).on_lot_created(lot_id, payload["supplier"], actor)
+            lot = _dict(connection.execute("SELECT * FROM food_lots WHERE id=?", (lot_id,)).fetchone()) or {}
+            lot["sampling"] = sampling
+            return lot
 
     def get_lot(self, lot_id: int, details: bool = True) -> dict[str, Any] | None:
         lot = self.connection.execute("SELECT * FROM food_lots WHERE id=?", (lot_id,)).fetchone()
@@ -150,6 +155,7 @@ class FoodService:
                 item["results"] = [dict(row) for row in self.connection.execute("SELECT * FROM food_test_results WHERE sample_id=? ORDER BY tested_at,id", (sample["id"],)).fetchall()]
                 result["samples"].append(item)
             result["shipments"] = [dict(row) for row in shipments]
+            result["sampling"] = RiskService(self.connection).lot_sampling_or_none(lot_id)
         return result
 
     def add_sample(self, lot_id: int, payload: dict[str, Any], actor: str = "inspector") -> dict[str, Any]:
@@ -180,7 +186,12 @@ class FoodService:
             if failed:
                 connection.execute("UPDATE food_lots SET risk_level='high',status='held',version=version+1,updated_at=? WHERE id=?", (now, lot_id))
             connection.execute("INSERT INTO food_audit(lot_id,action,actor,payload_json,created_at) VALUES(?,?,?,?,?)", (lot_id, "test.result", actor, json.dumps({**payload, "verdict": verdict}, ensure_ascii=False), now))
-            return _dict(connection.execute("SELECT * FROM food_test_results WHERE id=?", (cursor.lastrowid,)).fetchone()) or {}
+            created = _dict(connection.execute("SELECT * FROM food_test_results WHERE id=?", (cursor.lastrowid,)).fetchone()) or {}
+            if verdict == "fail":
+                # 超标结果进入供应商风险画像：生成事件并触发一次确定性重评分（同事务）。
+                lot_row = connection.execute("SELECT * FROM food_lots WHERE id=?", (lot_id,)).fetchone()
+                RiskService(connection).on_test_result(dict(lot_row), created)
+            return created
 
     def create_shipment(self, lot_id: int, payload: dict[str, Any], actor: str = "dispatcher") -> dict[str, Any]:
         lot = self.connection.execute("SELECT * FROM food_lots WHERE id=?", (lot_id,)).fetchone()
@@ -209,7 +220,12 @@ class FoodService:
             cursor = connection.execute("INSERT INTO food_temperatures(shipment_id,recorded_at,temperature_c,source,in_range,created_at) VALUES(?,?,?,?,?,?)", (shipment_id, payload["recorded_at"], payload["temperature_c"], payload["source"], in_range, now))
             if not in_range:
                 connection.execute("UPDATE food_shipments SET status='delayed',updated_at=? WHERE id=? AND status IN ('planned','in_transit')", (now, shipment_id))
-            return _dict(connection.execute("SELECT * FROM food_temperatures WHERE id=?", (cursor.lastrowid,)).fetchone()) or {}
+            created = _dict(connection.execute("SELECT * FROM food_temperatures WHERE id=?", (cursor.lastrowid,)).fetchone()) or {}
+            if not in_range:
+                # 温控越限进入供应商风险画像（同事务，按 temperature:{id} 幂等）。
+                lot_row = connection.execute("SELECT * FROM food_lots WHERE id=?", (shipment["lot_id"],)).fetchone()
+                RiskService(connection).on_temperature(dict(lot_row), dict(shipment), created)
+            return created
 
     def decide_risk(self, lot_id: int, payload: dict[str, Any]) -> dict[str, Any]:
         with transaction(immediate=True) as connection:
